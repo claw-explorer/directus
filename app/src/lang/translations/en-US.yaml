@@ -1661,7 +1661,13 @@ fields:
     ai_glossary_term: Term
     ai_glossary_note: Translation Note
     ai_translation_glossary: Translation Glossary
+    ai_translation_glossary_note:
+      'Define key terms and their approved translations across your languages. Keep product names, UI labels, and other important phrases consistent across your content.'
     ai_translation_style_guide: Translation Style Guide
+    ai_translation_style_guide_note:
+      'Describe how your content should be translated, including tone, formality, and formatting rules. Include details about your business, product, and audience to help AI keep your brand voice consistent.'
+    ai_translation_style_guide_placeholder:
+      'Translate in a confident, approachable tone. Use informal ''you,'' avoid slang, and keep terminology consistent.'
     ai_openai_api_key: OpenAI API Key
     ai_openai_allowed_models: OpenAI Allowed Models
     ai_anthropic_api_key: Anthropic API Key

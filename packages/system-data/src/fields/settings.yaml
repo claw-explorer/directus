@@ -893,6 +893,7 @@ fields:
     interface: list
     special:
       - cast-json
+    note: $t:fields.directus_settings.ai_translation_glossary_note
     options:
       template: '{{term}}'
       limit: 200
@@ -912,10 +913,10 @@ fields:
           name: $t:fields.directus_settings.ai_glossary_note
           type: string
           schema:
-            is_nullable: false
+            is_nullable: true
           meta:
             interface: input
-            required: true
+            required: false
             width: half
             options:
               placeholder: 'Never translate, keep as-is'
@@ -924,10 +925,12 @@ fields:
 
   - field: ai_translation_style_guide
     interface: input-rich-text-md
+    note: $t:fields.directus_settings.ai_translation_style_guide_note
     group: ai_group
     width: full
     options:
       label: $t:fields.directus_settings.ai_translation_style_guide
+      placeholder: $t:fields.directus_settings.ai_translation_style_guide_placeholder
 
   - field: ai_openai_compatible_divider
     interface: presentation-divider

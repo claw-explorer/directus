@@ -25,7 +25,7 @@ export type AiTranslationPromptOptions = {
 	sourceContent: Record<string, string>;
 	fields: Field[];
 	styleGuide?: string | null;
-	glossary?: Array<{ term: string; translation_note: string }> | null;
+	glossary?: Array<{ term: string; translation_note?: string }> | null;
 };
 
 export function isAiTranslateAvailable({
@@ -98,7 +98,7 @@ export function buildAiTranslationPrompt({
 		prompt += `## Glossary\nThese terms must be handled exactly as noted:\n`;
 
 		for (const entry of glossary) {
-			prompt += `- "${entry.term}" -> ${entry.translation_note}\n`;
+			prompt += entry.translation_note ? `- "${entry.term}" -> ${entry.translation_note}\n` : `- "${entry.term}"\n`;
 		}
 
 		prompt += '\n';
@@ -168,12 +168,12 @@ export async function resolveTranslationTargetPermission({
 	updatePermissionAccess: string | null | undefined;
 	fetchItemUpdatePermission: () => Promise<boolean>;
 }): Promise<TranslationTargetPermissionResult> {
-	if (isAdmin) {
-		return { allowed: true };
-	}
-
 	if (isMarkedForDeletion) {
 		return { allowed: false, reason: 'pending-delete' };
+	}
+
+	if (isAdmin) {
+		return { allowed: true };
 	}
 
 	if (itemPrimaryKey === undefined || itemPrimaryKey === null) {

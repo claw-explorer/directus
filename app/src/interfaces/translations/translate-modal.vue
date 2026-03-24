@@ -547,7 +547,7 @@ function useTargetPermissions() {
 							return response.data.data.update.access;
 						} catch (error) {
 							unexpectedError(error);
-							return true;
+							return false;
 						}
 					},
 				});

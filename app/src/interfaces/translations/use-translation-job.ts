@@ -41,6 +41,7 @@ export function useTranslationJob(options: {
 	const langStatuses = ref<Record<string, LangStatusEntry>>({});
 	const cancelled = ref(false);
 	const abortControllers = new Map<string, AbortController>();
+	let currentRunId = 0;
 
 	// Snapshot of the config used for the current/last job
 	let jobConfig: TranslationJobConfig | null = null;
@@ -135,6 +136,7 @@ export function useTranslationJob(options: {
 		jobState.value = 'translating';
 		cancelled.value = false;
 		langStatuses.value = {};
+		const runId = ++currentRunId;
 
 		// Init statuses for all targets
 		for (const langCode of config.targetLanguages) {
@@ -142,11 +144,13 @@ export function useTranslationJob(options: {
 		}
 
 		// Fire all concurrently
-		void Promise.allSettled(config.targetLanguages.map((langCode) => translateLanguage(langCode))).then(() => {
-			if (!cancelled.value) {
-				jobState.value = 'complete';
-			}
-		});
+		void Promise.allSettled(config.targetLanguages.map((langCode) => translateLanguage(langCode, 0, runId))).then(
+			() => {
+				if (!cancelled.value && runId === currentRunId) {
+					jobState.value = 'complete';
+				}
+			},
+		);
 	}
 
 	function cancel() {
@@ -168,6 +172,8 @@ export function useTranslationJob(options: {
 	}
 
 	async function retry(langCode: string) {
+		jobState.value = 'translating';
+
 		await translateLanguage(langCode);
 
 		// Check if all done after retry
@@ -178,8 +184,8 @@ export function useTranslationJob(options: {
 		}
 	}
 
-	async function translateLanguage(langCode: string, retryCount = 0): Promise<void> {
-		if (cancelled.value || !jobConfig || !jobShared) return;
+	async function translateLanguage(langCode: string, retryCount = 0, runId = currentRunId): Promise<void> {
+		if (cancelled.value || runId !== currentRunId || !jobConfig || !jobShared) return;
 
 		langStatuses.value[langCode] = { status: retryCount > 0 ? 'retrying' : 'translating' };
 
@@ -215,7 +221,7 @@ export function useTranslationJob(options: {
 
 			abortControllers.delete(langCode);
 
-			if (cancelled.value) return;
+			if (cancelled.value || runId !== currentRunId) return;
 
 			const translations = response.data.data;
 
@@ -228,7 +234,7 @@ export function useTranslationJob(options: {
 		} catch (error: any) {
 			abortControllers.delete(langCode);
 
-			if (cancelled.value) return;
+			if (cancelled.value || runId !== currentRunId) return;
 			if (error?.name === 'CanceledError' || error?.name === 'AbortError') return;
 
 			const statusCode = error?.response?.status;
@@ -239,8 +245,8 @@ export function useTranslationJob(options: {
 				langStatuses.value[langCode] = { status: 'retrying' };
 				await new Promise((resolve) => setTimeout(resolve, delay));
 
-				if (!cancelled.value) {
-					return translateLanguage(langCode, retryCount + 1);
+				if (!cancelled.value && runId === currentRunId) {
+					return translateLanguage(langCode, retryCount + 1, runId);
 				}
 
 				return;

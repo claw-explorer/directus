@@ -259,6 +259,69 @@ describe('useTranslationJob', () => {
 		expect(job.langStatuses.value['fr']?.status).not.toBe('error');
 	});
 
+	test('retry sets jobState to translating during retry', async () => {
+		const { job } = createJob();
+
+		let callCount = 0;
+
+		vi.mocked(api.post).mockImplementation(() => {
+			callCount++;
+
+			if (callCount === 1) {
+				return Promise.reject({ response: { status: 500, data: { errors: [{ message: 'fail' }] } } });
+			}
+
+			return Promise.resolve({ data: { data: { title: 'Translated' } } });
+		});
+
+		job.start({ ...baseConfig, targetLanguages: ['fr'] });
+		await flushPromises();
+
+		expect(job.langStatuses.value['fr']?.status).toBe('error');
+		expect(job.jobState.value).toBe('complete');
+
+		mockApiSuccess();
+
+		const retryPromise = job.retry('fr');
+
+		expect(job.jobState.value).toBe('translating');
+
+		await retryPromise;
+
+		expect(job.langStatuses.value['fr']?.status).toBe('done');
+		expect(job.jobState.value).toBe('complete');
+	});
+
+	test('stale run completion does not overwrite newer run state', async () => {
+		const { job } = createJob();
+
+		let resolveFirstRun: ((value: any) => void) | undefined;
+
+		vi.mocked(api.post).mockImplementationOnce(
+			() => new Promise((resolve) => { resolveFirstRun = resolve; }),
+		);
+
+		job.start({ ...baseConfig, targetLanguages: ['fr'] });
+
+		expect(job.jobState.value).toBe('translating');
+
+		// Start a second run while the first is still in-flight
+		mockApiSuccess({ title: 'Second' });
+		job.start({ ...baseConfig, targetLanguages: ['es'] });
+		await flushPromises();
+
+		expect(job.jobState.value).toBe('complete');
+		expect(job.langStatuses.value['es']?.status).toBe('done');
+
+		// Now resolve the first run's promise — it should NOT overwrite state
+		resolveFirstRun!({ data: { data: { title: 'First' } } });
+		await flushPromises();
+
+		// jobState should still reflect the second run
+		expect(job.jobState.value).toBe('complete');
+		expect(Object.keys(job.langStatuses.value)).toEqual(['es']);
+	});
+
 	test('reset clears all state back to initial', async () => {
 		const { job } = createJob();
 

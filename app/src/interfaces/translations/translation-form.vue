@@ -196,16 +196,16 @@ function onToggleDelete(item: DisplayItem, itemInitial?: DisplayItem) {
 			</template>
 
 			<template #controls="{ active, toggle }">
-				<button
+				<span
 					v-if="isTranslatingLanguage"
 					class="header-translate-btn translating"
 					@click.stop="emit('openTranslateDrawer')"
 				>
 					<AiMagicButton animate class="header-sparkle" />
 					<span>{{ $t('interfaces.translations.ai_translating') }}</span>
-				</button>
+				</span>
 
-				<button
+				<span
 					v-else-if="showAiTranslate"
 					ref="translateBtn"
 					class="header-translate-btn"
@@ -215,7 +215,7 @@ function onToggleDelete(item: DisplayItem, itemInitial?: DisplayItem) {
 					<span v-tooltip="$t('interfaces.translations.ai_translate_tooltip')">
 						{{ $t('interfaces.translations.ai_translate_short') }}
 					</span>
-				</button>
+				</span>
 
 				<VRemove
 					v-if="item && !(nonEditable && item.$type !== 'deleted')"

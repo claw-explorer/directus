@@ -108,6 +108,23 @@ describe('getAiTranslationFieldBehavior', () => {
 });
 
 describe('buildAiTranslationPrompt', () => {
+	test('handles glossary items without a translation note', () => {
+		const prompt = buildAiTranslationPrompt({
+			sourceLangName: 'English',
+			targetLangNames: ['French'],
+			sourceContent: { title: 'Hello' },
+			fields: [{ field: 'title', type: 'string', meta: { interface: 'input' } }] as any,
+			glossary: [
+				{ term: 'Directus', translation_note: 'Keep as-is' },
+				{ term: 'Dashboard' },
+			],
+		});
+
+		expect(prompt).toContain('"Directus" -> Keep as-is');
+		expect(prompt).toContain('"Dashboard"');
+		expect(prompt).not.toContain('"Dashboard" ->');
+	});
+
 	test('builds field-specific instructions from metadata', () => {
 		const prompt = buildAiTranslationPrompt({
 			sourceLangName: 'English',
@@ -208,5 +225,21 @@ describe('resolveTranslationTargetPermission', () => {
 		});
 
 		expect(fetchItemUpdatePermission).toHaveBeenCalledOnce();
+	});
+
+	test('blocks deleted targets even for admins', async () => {
+		await expect(
+			resolveTranslationTargetPermission({
+				isAdmin: true,
+				isMarkedForDeletion: true,
+				itemPrimaryKey: 1,
+				hasCreatePermission: true,
+				updatePermissionAccess: 'full',
+				fetchItemUpdatePermission: vi.fn(),
+			}),
+		).resolves.toEqual({
+			allowed: false,
+			reason: 'pending-delete',
+		});
 	});
 });
