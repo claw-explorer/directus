@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { useElementHover } from '@vueuse/core';
 import { isEmpty } from 'lodash';
-import { computed, ref, watch } from 'vue';
+import { computed, ref, useTemplateRef, watch } from 'vue';
 import LanguageSelect from './language-select.vue';
 import type { TranslationJob } from './use-translation-job';
 import AiMagicButton from '@/ai/components/ai-magic-button.vue';
@@ -86,7 +87,8 @@ const isTranslatingLanguage = computed(() => {
 	return translationJob.pendingLanguages.value.has(lang.value);
 });
 
-const isHoveringTranslateButton = ref(false);
+const translateBtn = useTemplateRef<HTMLButtonElement>('translateBtn');
+const isHoveringTranslateButton = useElementHover(translateBtn);
 
 const activatorDisabled = computed(() => {
 	return (
@@ -206,9 +208,8 @@ function onToggleDelete(item: DisplayItem, itemInitial?: DisplayItem) {
 				<button
 					v-else-if="showAiTranslate"
 					class="header-translate-btn"
+					ref="translateBtn"
 					@click.stop="emit('openTranslateDrawer')"
-					@mouseenter="isHoveringTranslateButton = true"
-					@mouseleave="isHoveringTranslateButton = false"
 				>
 					<AiMagicButton :animate="isHoveringTranslateButton" class="header-sparkle" />
 					<span v-tooltip="$t('interfaces.translations.ai_translate_tooltip')">
