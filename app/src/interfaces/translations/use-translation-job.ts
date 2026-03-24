@@ -87,7 +87,7 @@ export function useTranslationJob(options: {
 	});
 
 	// Prevent browser tab close while translating
-	useEventListener(document, 'beforeunload', (event: BeforeUnloadEvent) => {
+	useEventListener(window, 'beforeunload', (event: BeforeUnloadEvent) => {
 		if (isTranslating.value) {
 			event.preventDefault();
 		}
@@ -125,6 +125,7 @@ export function useTranslationJob(options: {
 		}
 
 		abortControllers.value.clear();
+		langStatuses.value = {};
 		jobState.value = 'idle';
 	}
 

@@ -277,6 +277,7 @@ watch(
 	() => props.translationJob.jobState.value,
 	(state) => {
 		if (state !== 'complete') return;
+		if (props.translationJob.hasErrors.value) return;
 
 		props.translationJob.reset();
 		resetToConfig();
