@@ -63,17 +63,32 @@ const getItemWithLang = (items: Record<string, any>[], lang: string | undefined)
 	items.find((item) => item.languages_code?.code === lang);
 
 function createMockTranslationJob(): TranslationJob {
+	const jobState = ref<'idle' | 'translating' | 'complete'>('idle');
+	const langStatuses = ref<Record<string, { status: string; error?: string }>>({});
+
 	return {
-		jobState: ref('idle'),
-		langStatuses: ref({}),
-		isTranslating: computed(() => false),
-		hasErrors: computed(() => false),
-		completedCount: computed(() => 0),
-		translatedCount: computed(() => 0),
-		totalCount: computed(() => 0),
+		jobState,
+		langStatuses,
+		isTranslating: computed(() => jobState.value === 'translating'),
+		hasErrors: computed(() => Object.values(langStatuses.value).some((entry) => entry.status === 'error')),
+		completedCount: computed(
+			() =>
+				Object.values(langStatuses.value).filter((entry) => entry.status === 'done' || entry.status === 'error').length,
+		),
+		translatedCount: computed(
+			() => Object.values(langStatuses.value).filter((entry) => entry.status === 'done').length,
+		),
+		totalCount: computed(() => Object.keys(langStatuses.value).length),
 		progressPercent: computed(() => 0),
 		progressLabel: computed(() => '0/0'),
-		pendingLanguages: computed(() => new Set<string>()),
+		pendingLanguages: computed(
+			() =>
+				new Set(
+					Object.entries(langStatuses.value)
+						.filter(([, entry]) => ['pending', 'translating', 'retrying'].includes(entry.status))
+						.map(([langCode]) => langCode),
+				),
+		),
 		pendingFields: computed(() => new Set<string>()),
 		start: vi.fn(),
 		cancel: vi.fn(),
@@ -127,6 +142,9 @@ function mountModal({
 
 	const global: GlobalMountOptions = {
 		plugins: [i18n, pinia],
+		directives: {
+			tooltip: () => undefined,
+		},
 		stubs: {
 			VDrawer: {
 				props: ['modelValue'],
@@ -291,5 +309,69 @@ describe('translate-modal', () => {
 		expect(config.sourceContent).toHaveProperty('title', 'Hello');
 		expect(config.sourceContent).toHaveProperty('slug', 'hello-world');
 		expect(config.sourceContent).toHaveProperty('body', '# Hello\n\nText');
+	});
+
+	test('reopens completed failed jobs in the status view so they can be retried', async () => {
+		const mockJob = createMockTranslationJob() as any;
+		mockJob.jobState.value = 'complete';
+
+		mockJob.langStatuses.value = {
+			fr: {
+				status: 'error',
+				error: 'Provider timeout',
+			},
+		};
+
+		const wrapper = mountModal({
+			permissions: {
+				article_translations: {
+					create: { access: 'full' },
+					update: { access: 'full' },
+				},
+			},
+			displayItems: [{ title: 'Hello', slug: 'hello', body: '# Hello', languages_code: { code: 'en' } }],
+			translationJob: mockJob,
+		});
+
+		await wrapper.setProps({ modelValue: true });
+		await flushPromises();
+
+		expect(wrapper.text()).toContain('French');
+		expect(wrapper.text()).toContain('Provider timeout');
+		expect(wrapper.text()).toContain('retry');
+		expect(wrapper.text()).not.toContain('Source Language');
+	});
+
+	test('resets completed successful jobs back to the config view', async () => {
+		const mockJob = createMockTranslationJob() as any;
+
+		const wrapper = mountModal({
+			permissions: {
+				article_translations: {
+					create: { access: 'full' },
+					update: { access: 'full' },
+				},
+			},
+			displayItems: [{ title: 'Hello', slug: 'hello', body: '# Hello', languages_code: { code: 'en' } }],
+			translationJob: mockJob,
+		});
+
+		await wrapper.setProps({ modelValue: true });
+		await flushPromises();
+
+		mockJob.langStatuses.value = {
+			fr: {
+				status: 'done',
+			},
+		};
+
+		mockJob.jobState.value = 'complete';
+		await wrapper.vm.$nextTick();
+		await wrapper.setProps({ modelValue: true });
+		await flushPromises();
+
+		expect(mockJob.reset).toHaveBeenCalled();
+		expect(wrapper.text()).toContain('Source Language');
+		expect(wrapper.text()).not.toContain('Retry');
 	});
 });

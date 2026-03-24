@@ -30,6 +30,23 @@ import { usePermissionsStore } from '@/stores/permissions';
 import { useUserStore } from '@/stores/user';
 import { unexpectedError } from '@/utils/unexpected-error';
 
+const nonTranslatableInterfaces = new Set([
+	'select-dropdown',
+	'select-multiple-dropdown',
+	'select-radio',
+	'select-multiple-checkbox',
+	'boolean',
+	'datetime',
+	'slider',
+	'toggle',
+	'file',
+	'file-image',
+	'files',
+	'collection',
+	'map',
+	'color',
+]);
+
 const props = defineProps<{
 	modelValue: boolean;
 	languageOptions: Record<string, any>[];
@@ -50,93 +67,34 @@ const aiStore = useAiStore();
 const permissionsStore = usePermissionsStore();
 const userStore = useUserStore();
 
-// Local UI state — whether the user is viewing config vs progress/completion
-const showingConfig = ref(true);
-
-type ModalState = 'config' | 'translating';
+type ModalState = 'config' | 'status';
 
 const modalState = computed<ModalState>(() => {
-	if (props.translationJob.jobState.value === 'translating') return 'translating';
+	if (props.translationJob.jobState.value === 'translating') return 'status';
+	if (props.translationJob.jobState.value === 'complete' && props.translationJob.hasErrors.value) return 'status';
 	return 'config';
 });
-
-const targetPermissions = ref<
-	Record<string, { allowed: boolean; loading: boolean; reason?: TranslationTargetPermissionReason }>
->({});
-
-const permissionsLoaded = ref(false);
-let permissionRequestId = 0;
 
 const sourceLanguage = ref<string>(props.defaultSourceLanguage ?? props.languageOptions[0]?.value ?? '');
 const selectedFields = ref<string[]>([]);
 const selectedTargetLanguages = ref<string[]>([]);
 
-// Model selection — separate from chat, persisted independently
-const selectedModelId = useLocalStorage<string | null>('selected-ai-translation-model', null);
+const {
+	selectedModel,
+	onModelSelect,
+	modelSelectorActive,
+	modelSearch,
+	shouldShowModelSelector,
+	shouldShowModelSearch,
+	visibleModels,
+} = useModelSelection();
 
-const selectedModel = computed<AppModelDefinition | null>(() => {
-	if (!selectedModelId.value) return aiStore.models[0] ?? null;
-
-	const colonIndex = selectedModelId.value.indexOf(':');
-	if (colonIndex === -1) return aiStore.models[0] ?? null;
-
-	const provider = selectedModelId.value.slice(0, colonIndex);
-	const model = selectedModelId.value.slice(colonIndex + 1);
-
-	return aiStore.models.find((m) => m.provider === provider && m.model === model) ?? aiStore.models[0] ?? null;
-});
-
-function onModelSelect(model: AppModelDefinition) {
-	selectedModelId.value = `${model.provider}:${model.model}`;
-}
-
-const modelSelectorActive = ref(false);
-const modelSearch = ref('');
-
-const shouldShowModelSelector = computed(() => aiStore.models.length > 1);
-
-const shouldShowModelSearch = computed(() => aiStore.models.length > 10 || modelSearch.value.length > 0);
-
-const visibleModels = computed(() => {
-	const searchTerm = modelSearch.value.trim().toLowerCase();
-
-	if (!searchTerm) return aiStore.models;
-
-	return aiStore.models.filter((model) =>
-		[model.name, model.model, model.provider].some((value) => value.toLowerCase().includes(searchTerm)),
-	);
-});
-
-watch(modelSelectorActive, (active) => {
-	if (!active) {
-		modelSearch.value = '';
-	}
-});
-
-// Translatable fields — string/text only, not hidden/readonly, not FK/PK
 const translatableFields = computed(() => {
 	if (!props.relationInfo) return [];
 
 	const junctionField = props.relationInfo.junctionField.field;
 	const reverseJunctionField = props.relationInfo.reverseJunctionField.field;
 	const pkField = props.relationInfo.junctionPrimaryKeyField.field;
-
-	const nonTranslatableInterfaces = new Set([
-		'select-dropdown',
-		'select-multiple-dropdown',
-		'select-radio',
-		'select-multiple-checkbox',
-		'boolean',
-		'datetime',
-		'slider',
-		'toggle',
-		'file',
-		'file-image',
-		'files',
-		'collection',
-		'map',
-		'color',
-	]);
 
 	return props.fields.filter((field) => {
 		if (field.field === junctionField) return false;
@@ -150,12 +108,10 @@ const translatableFields = computed(() => {
 	});
 });
 
-// Field labels for display
 function getFieldLabel(field: Field): string {
 	return field.name ?? field.field;
 }
 
-// Source content preview for a field
 function getSourceFieldValue(fieldName: string): string | null {
 	const item = props.getItemWithLang(props.displayItems, sourceLanguage.value);
 	if (!item) return null;
@@ -174,7 +130,6 @@ function getTruncatedSourceValue(fieldName: string, maxLength = 60): string {
 	return val.slice(0, maxLength) + '…';
 }
 
-// Target languages — all except source
 const targetLanguageOptions = computed(() =>
 	props.languageOptions
 		.filter((lang) => lang.value !== sourceLanguage.value)
@@ -216,13 +171,15 @@ const languageFieldProgress = computed(() => {
 	return result;
 });
 
-const permittedTargetLanguages = computed(() =>
-	selectedTargetLanguages.value.filter((langCode) => targetPermissions.value[langCode]?.allowed === true),
-);
-
-const permissionsLoading = computed(() =>
-	targetLanguageOptions.value.some((lang) => targetPermissions.value[lang.value]?.loading === true),
-);
+const {
+	targetPermissions,
+	permissionsLoaded,
+	permissionsLoading,
+	permittedTargetLanguages,
+	loadTargetPermissions,
+	ensureTargetPermissionsLoaded,
+	getTargetPermissionReason,
+} = useTargetPermissions();
 
 const translatableFieldsByName = computed(() => new Map(translatableFields.value.map((field) => [field.field, field])));
 
@@ -240,7 +197,6 @@ const emptySourceFields = computed(() => {
 	return empty;
 });
 
-// Preselect fields with source content
 function preselectFieldsFromSource() {
 	const sourceItem = props.getItemWithLang(props.displayItems, sourceLanguage.value);
 
@@ -252,14 +208,11 @@ function preselectFieldsFromSource() {
 		.map((f) => f.field);
 }
 
-// Initialize selections when drawer opens
 watch(
 	() => props.modelValue,
 	(open) => {
 		if (open) {
-			// If a job is currently running, show progress
-			if (props.translationJob.jobState.value === 'translating') {
-				showingConfig.value = false;
+			if (modalState.value === 'status') {
 				return;
 			}
 
@@ -272,7 +225,6 @@ watch(
 	},
 );
 
-// Auto-reset to config when translation completes
 watch(
 	() => props.translationJob.jobState.value,
 	(state) => {
@@ -285,7 +237,6 @@ watch(
 );
 
 function resetToConfig() {
-	showingConfig.value = true;
 	permissionsLoaded.value = false;
 	targetPermissions.value = {};
 	sourceLanguage.value = props.defaultSourceLanguage ?? props.languageOptions[0]?.value ?? '';
@@ -311,97 +262,6 @@ watch(sourceLanguage, (newSource, oldSource) => {
 	}
 });
 
-function getTargetPermissionReason(langCode: string): string | null {
-	const reason = targetPermissions.value[langCode]?.reason;
-
-	if (reason === 'pending-delete') {
-		return t('interfaces.translations.translation_pending_delete');
-	}
-
-	if (reason === 'not-allowed') {
-		return t('interfaces.translations.translation_not_allowed');
-	}
-
-	return null;
-}
-
-async function loadTargetPermissions() {
-	if (!props.relationInfo) {
-		targetPermissions.value = {};
-		permissionsLoaded.value = true;
-		return;
-	}
-
-	const requestId = ++permissionRequestId;
-	const info = props.relationInfo;
-	const collection = info.junctionCollection.collection;
-	const updatePermissionAccess = permissionsStore.getPermission(collection, 'update')?.access ?? null;
-	const hasCreatePermission = permissionsStore.hasPermission(collection, 'create');
-
-	targetPermissions.value = Object.fromEntries(
-		targetLanguageOptions.value.map((lang) => [
-			lang.value,
-			{
-				allowed: false,
-				loading: true,
-			},
-		]),
-	);
-
-	permissionsLoaded.value = false;
-
-	const permissionEntries = await Promise.all(
-		targetLanguageOptions.value.map(async (lang) => {
-			const existing = props.getItemWithLang(props.displayItems, lang.value);
-			const itemPrimaryKey = existing?.[info.junctionPrimaryKeyField.field];
-
-			const permission = await resolveTranslationTargetPermission({
-				isAdmin: userStore.isAdmin,
-				isMarkedForDeletion: existing?.$type === 'deleted',
-				itemPrimaryKey,
-				hasCreatePermission,
-				updatePermissionAccess,
-				fetchItemUpdatePermission: async () => {
-					if (itemPrimaryKey === undefined || itemPrimaryKey === null) {
-						return false;
-					}
-
-					try {
-						const response = await api.get<{ data: { update: { access: boolean } } }>(
-							`/permissions/me/${collection}/${encodeURIComponent(itemPrimaryKey)}`,
-						);
-
-						return response.data.data.update.access;
-					} catch (error) {
-						unexpectedError(error);
-						return true;
-					}
-				},
-			});
-
-			return [lang.value, { ...permission, loading: false }] as const;
-		}),
-	);
-
-	if (requestId !== permissionRequestId) {
-		return;
-	}
-
-	targetPermissions.value = Object.fromEntries(permissionEntries);
-	permissionsLoaded.value = true;
-
-	selectedTargetLanguages.value = selectedTargetLanguages.value.filter(
-		(lang) => lang !== sourceLanguage.value && targetPermissions.value[lang]?.allowed === true,
-	);
-}
-
-async function ensureTargetPermissionsLoaded() {
-	if (!permissionsLoaded.value || permissionsLoading.value) {
-		await loadTargetPermissions();
-	}
-}
-
-// Select/Deselect
 function selectAllFields() {
 	selectedFields.value = translatableFields.value
 		.filter((f) => !emptySourceFields.value.has(f.field))
@@ -446,7 +306,6 @@ function toggleTargetSelection(langCode: string, enabled: boolean) {
 	selectedTargetLanguages.value = selectedTargetLanguages.value.filter((lang) => lang !== langCode);
 }
 
-// Source content for the prompt
 const sourceContent = computed(() => {
 	const item = props.getItemWithLang(props.displayItems, sourceLanguage.value);
 	const content: Record<string, string> = {};
@@ -490,7 +349,6 @@ const canTranslate = computed(
 		!permissionsLoading.value,
 );
 
-// Translate — delegate to composable
 async function translate() {
 	if (!selectedModel.value) return;
 
@@ -499,26 +357,17 @@ async function translate() {
 	if (!canTranslate.value) return;
 
 	const job = props.translationJob;
-
-	// Handle blocked targets — set error in job's langStatuses before starting
-	const blockedTargets = selectedTargetLanguages.value.filter(
-		(langCode) => targetPermissions.value[langCode]?.allowed !== true,
-	);
-
 	const allowedTargets = permittedTargetLanguages.value;
 
 	if (allowedTargets.length === 0) {
 		return;
 	}
 
-	// Build field definitions for the snapshot
 	const fieldsWithContent = Object.keys(sourceContent.value);
 
 	const fieldDefinitions = fieldsWithContent
 		.map((fieldName) => translatableFieldsByName.value.get(fieldName))
 		.filter((field): field is Field => field !== undefined);
-
-	showingConfig.value = false;
 
 	job.start({
 		sourceLanguage: sourceLanguage.value,
@@ -529,15 +378,6 @@ async function translate() {
 		fieldDefinitions,
 	});
 
-	// Set blocked targets as errors after start
-	for (const langCode of blockedTargets) {
-		job.langStatuses.value[langCode] = {
-			status: 'error',
-			error: getTargetPermissionReason(langCode) ?? t('not_allowed'),
-		};
-	}
-
-	// Auto-close drawer — translations continue in the background
 	close();
 }
 
@@ -558,7 +398,6 @@ async function retryLanguage(langCode: string) {
 	await props.translationJob.retry(langCode);
 }
 
-// Close — no longer cancels
 function close() {
 	emit('update:modelValue', false);
 }
@@ -568,57 +407,180 @@ function cancelJob() {
 	emit('update:modelValue', false);
 }
 
-// Read progress from the job
-const job = computed(() => props.translationJob);
+const job = props.translationJob;
 
 const errorLanguages = computed(() =>
-	Object.entries(job.value.langStatuses.value)
+	Object.entries(job.langStatuses.value)
 		.filter(([, entry]) => entry.status === 'error')
 		.map(([langCode]) => langCode),
 );
 
-function langChipStyle(status: string | undefined) {
-	switch (status) {
-		case 'done':
-			return {
-				'--v-chip-color': 'var(--theme--success)',
-				'--v-chip-background-color': 'var(--theme--success-background)',
-			};
-		case 'error':
-			return {
-				'--v-chip-color': 'var(--theme--danger)',
-				'--v-chip-background-color': 'var(--theme--danger-background)',
-			};
-		case 'translating':
-		case 'retrying':
-			return {
-				'--v-chip-color': 'var(--theme--primary)',
-				'--v-chip-background-color': 'var(--theme--primary-background)',
-			};
-		default:
-			return {
-				'--v-chip-color': 'var(--theme--foreground-subdued)',
-				'--v-chip-background-color': 'var(--theme--background-normal)',
-			};
-	}
-}
+const statusIcons: Record<string, string> = {
+	done: 'check',
+	error: 'error',
+	translating: 'progress_activity',
+	retrying: 'progress_activity',
+};
 
 function langStatusIcon(status: string | undefined) {
-	switch (status) {
-		case 'done':
-			return 'check';
-		case 'error':
-			return 'error';
-		case 'translating':
-		case 'retrying':
-			return 'progress_activity';
-		default:
-			return 'circle';
-	}
+	return (status && statusIcons[status]) ?? 'circle';
 }
 
 function isActiveStatus(status: string | undefined) {
 	return status === 'translating' || status === 'retrying';
+}
+
+function useModelSelection() {
+	const selectedModelId = useLocalStorage<string | null>('selected-ai-translation-model', null);
+
+	const selectedModel = computed<AppModelDefinition | null>(() => {
+		if (!selectedModelId.value) return aiStore.models[0] ?? null;
+
+		const colonIndex = selectedModelId.value.indexOf(':');
+		if (colonIndex === -1) return aiStore.models[0] ?? null;
+
+		const provider = selectedModelId.value.slice(0, colonIndex);
+		const model = selectedModelId.value.slice(colonIndex + 1);
+
+		return aiStore.models.find((m) => m.provider === provider && m.model === model) ?? aiStore.models[0] ?? null;
+	});
+
+	function onModelSelect(model: AppModelDefinition) {
+		selectedModelId.value = `${model.provider}:${model.model}`;
+	}
+
+	const modelSelectorActive = ref(false);
+	const modelSearch = ref('');
+
+	const shouldShowModelSelector = computed(() => aiStore.models.length > 1);
+	const shouldShowModelSearch = computed(() => aiStore.models.length > 10 || modelSearch.value.length > 0);
+
+	const visibleModels = computed(() => {
+		const searchTerm = modelSearch.value.trim().toLowerCase();
+
+		if (!searchTerm) return aiStore.models;
+
+		return aiStore.models.filter((model) =>
+			[model.name, model.model, model.provider].some((value) => value.toLowerCase().includes(searchTerm)),
+		);
+	});
+
+	watch(modelSelectorActive, (active) => {
+		if (!active) {
+			modelSearch.value = '';
+		}
+	});
+
+	return {
+		selectedModel,
+		onModelSelect,
+		modelSelectorActive,
+		modelSearch,
+		shouldShowModelSelector,
+		shouldShowModelSearch,
+		visibleModels,
+	};
+}
+
+function useTargetPermissions() {
+	const targetPermissions = ref<
+		Record<string, { allowed: boolean; loading: boolean; reason?: TranslationTargetPermissionReason }>
+	>({});
+
+	const permissionsLoaded = ref(false);
+	let permissionRequestId = 0;
+
+	const permissionsLoading = computed(() =>
+		targetLanguageOptions.value.some((lang) => targetPermissions.value[lang.value]?.loading === true),
+	);
+
+	const permittedTargetLanguages = computed(() =>
+		selectedTargetLanguages.value.filter((langCode) => targetPermissions.value[langCode]?.allowed === true),
+	);
+
+	function getTargetPermissionReason(langCode: string): string | null {
+		const reason = targetPermissions.value[langCode]?.reason;
+
+		if (reason === 'pending-delete') return t('interfaces.translations.translation_pending_delete');
+		if (reason === 'not-allowed') return t('interfaces.translations.translation_not_allowed');
+		return null;
+	}
+
+	async function loadTargetPermissions() {
+		if (!props.relationInfo) {
+			targetPermissions.value = {};
+			permissionsLoaded.value = true;
+			return;
+		}
+
+		const requestId = ++permissionRequestId;
+		const info = props.relationInfo;
+		const collection = info.junctionCollection.collection;
+		const updatePermissionAccess = permissionsStore.getPermission(collection, 'update')?.access ?? null;
+		const hasCreatePermission = permissionsStore.hasPermission(collection, 'create');
+
+		targetPermissions.value = Object.fromEntries(
+			targetLanguageOptions.value.map((lang) => [lang.value, { allowed: false, loading: true }]),
+		);
+
+		permissionsLoaded.value = false;
+
+		const permissionEntries = await Promise.all(
+			targetLanguageOptions.value.map(async (lang) => {
+				const existing = props.getItemWithLang(props.displayItems, lang.value);
+				const itemPrimaryKey = existing?.[info.junctionPrimaryKeyField.field];
+
+				const permission = await resolveTranslationTargetPermission({
+					isAdmin: userStore.isAdmin,
+					isMarkedForDeletion: existing?.$type === 'deleted',
+					itemPrimaryKey,
+					hasCreatePermission,
+					updatePermissionAccess,
+					fetchItemUpdatePermission: async () => {
+						if (itemPrimaryKey === undefined || itemPrimaryKey === null) return false;
+
+						try {
+							const response = await api.get<{ data: { update: { access: boolean } } }>(
+								`/permissions/me/${collection}/${encodeURIComponent(itemPrimaryKey)}`,
+							);
+
+							return response.data.data.update.access;
+						} catch (error) {
+							unexpectedError(error);
+							return true;
+						}
+					},
+				});
+
+				return [lang.value, { ...permission, loading: false }] as const;
+			}),
+		);
+
+		if (requestId !== permissionRequestId) return;
+
+		targetPermissions.value = Object.fromEntries(permissionEntries);
+		permissionsLoaded.value = true;
+
+		selectedTargetLanguages.value = selectedTargetLanguages.value.filter(
+			(lang) => lang !== sourceLanguage.value && targetPermissions.value[lang]?.allowed === true,
+		);
+	}
+
+	async function ensureTargetPermissionsLoaded() {
+		if (!permissionsLoaded.value || permissionsLoading.value) {
+			await loadTargetPermissions();
+		}
+	}
+
+	return {
+		targetPermissions,
+		permissionsLoaded,
+		permissionsLoading,
+		permittedTargetLanguages,
+		loadTargetPermissions,
+		ensureTargetPermissionsLoaded,
+		getTargetPermissionReason,
+	};
 }
 </script>
 
@@ -855,8 +817,8 @@ function isActiveStatus(status: string | undefined) {
 				</template>
 			</template>
 
-			<!-- State 2: Translating -->
-			<template v-if="modalState === 'translating'">
+			<!-- State 2: Active or failed translation job -->
+			<template v-if="modalState === 'status'">
 				<p class="translating-title">
 					{{
 						t('interfaces.translations.ai_translating_progress', {
@@ -872,7 +834,7 @@ function isActiveStatus(status: string | undefined) {
 						:key="langCode"
 						small
 						disabled
-						:style="langChipStyle(job.langStatuses.value[langCode]?.status)"
+						:class="`status-${job.langStatuses.value[langCode]?.status ?? 'pending'}`"
 					>
 						<VIcon
 							:name="langStatusIcon(job.langStatuses.value[langCode]?.status)"
@@ -902,7 +864,7 @@ function isActiveStatus(status: string | undefined) {
 	</VDrawer>
 </template>
 
-<style lang="scss" scoped>
+<style scoped>
 .drawer-title {
 	font-weight: 600;
 }
@@ -912,10 +874,8 @@ function isActiveStatus(status: string | undefined) {
 	padding-block-end: var(--content-padding-bottom);
 }
 
-.section {
-	& + .section {
-		margin-block-start: 1.5rem;
-	}
+.section + .section {
+	margin-block-start: 1.5rem;
 }
 
 .section-header {
@@ -933,10 +893,10 @@ function isActiveStatus(status: string | undefined) {
 .field-grid {
 	display: grid;
 	gap: 1rem;
-}
 
-.field-grid.has-two-columns {
-	grid-template-columns: repeat(2, minmax(0, 1fr));
+	&.has-two-columns {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
 }
 
 .field-group {
@@ -990,17 +950,17 @@ function isActiveStatus(status: string | undefined) {
 	background-color: var(--theme--background);
 	border-start-start-radius: var(--theme--border-radius);
 
-	button {
+	& button {
 		color: var(--theme--foreground-subdued);
 		cursor: pointer;
 		transition: color var(--fast) var(--transition);
 	}
 
-	button:hover:not(:disabled) {
+	& button:hover:not(:disabled) {
 		color: var(--theme--foreground);
 	}
 
-	button:disabled {
+	& button:disabled {
 		color: var(--theme--foreground-subdued);
 		cursor: not-allowed;
 		opacity: 0.5;
@@ -1109,6 +1069,27 @@ function isActiveStatus(status: string | undefined) {
 	flex-wrap: wrap;
 	gap: 0.5rem;
 	margin-block-end: 1rem;
+
+	& .status-done {
+		--v-chip-color: var(--theme--success);
+		--v-chip-background-color: var(--theme--success-background);
+	}
+
+	& .status-error {
+		--v-chip-color: var(--theme--danger);
+		--v-chip-background-color: var(--theme--danger-background);
+	}
+
+	& .status-translating,
+	& .status-retrying {
+		--v-chip-color: var(--theme--primary);
+		--v-chip-background-color: var(--theme--primary-background);
+	}
+
+	& .status-pending {
+		--v-chip-color: var(--theme--foreground-subdued);
+		--v-chip-background-color: var(--theme--background-normal);
+	}
 }
 
 .spinning {

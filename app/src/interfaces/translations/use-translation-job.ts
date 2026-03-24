@@ -9,8 +9,6 @@ import {
 } from './ai-translation';
 import type { AppModelDefinition } from '@/ai/models';
 import api from '@/api';
-import type { RelationM2M } from '@/composables/use-relation-m2m';
-import type { DisplayItem } from '@/composables/use-relation-multiple';
 import { useSettingsStore } from '@/stores/settings';
 
 export type LangStatus = 'pending' | 'translating' | 'retrying' | 'done' | 'error';
@@ -35,10 +33,6 @@ const MAX_RETRIES = 3;
 export function useTranslationJob(options: {
 	applyTranslatedFields: (fields: Record<string, string>, lang: string | undefined) => void;
 	languageOptions: ComputedRef<Record<string, any>[]>;
-	displayItems: ComputedRef<DisplayItem[]>;
-	fields: ComputedRef<Field[]>;
-	relationInfo: ComputedRef<RelationM2M | undefined>;
-	getItemWithLang: (items: Record<string, any>[], lang: string | undefined) => DisplayItem | undefined;
 }) {
 	const { t } = useI18n();
 	const settingsStore = useSettingsStore();
@@ -46,7 +40,7 @@ export function useTranslationJob(options: {
 	const jobState = ref<'idle' | 'translating' | 'complete'>('idle');
 	const langStatuses = ref<Record<string, LangStatusEntry>>({});
 	const cancelled = ref(false);
-	const abortControllers = ref<Map<string, AbortController>>(new Map());
+	const abortControllers = new Map<string, AbortController>();
 
 	// Snapshot of the config used for the current/last job
 	let jobConfig: TranslationJobConfig | null = null;
@@ -93,12 +87,50 @@ export function useTranslationJob(options: {
 		}
 	});
 
+	// Precomputed data shared across all languages in a job
+	let jobShared: {
+		selectedFieldDefinitions: Field[];
+		outputSchema: Record<string, any>;
+		langOptionsByCode: Map<string, Record<string, any>>;
+		sourceLangName: string;
+	} | null = null;
+
 	function start(config: TranslationJobConfig) {
 		// Cancel any prior job
 		cancel();
 
 		// Snapshot config
 		jobConfig = { ...config };
+
+		// Precompute shared data once for all languages
+		const fieldsWithContent = Object.keys(config.sourceContent);
+		const fieldDefsByName = new Map(config.fieldDefinitions.map((f) => [f.field, f]));
+
+		const selectedFieldDefinitions = fieldsWithContent
+			.map((fieldName) => fieldDefsByName.get(fieldName))
+			.filter((field): field is Field => field !== undefined);
+
+		const fieldProperties: Record<string, any> = {};
+
+		for (const field of selectedFieldDefinitions) {
+			fieldProperties[field.field] = {
+				type: 'string',
+				description: getAiTranslationFieldDescription(field),
+			};
+		}
+
+		const langOptionsByCode = new Map(options.languageOptions.value.map((l) => [l.value, l]));
+
+		jobShared = {
+			selectedFieldDefinitions,
+			outputSchema: {
+				type: 'object',
+				properties: fieldProperties,
+				required: fieldsWithContent,
+			},
+			langOptionsByCode,
+			sourceLangName: langOptionsByCode.get(config.sourceLanguage)?.text ?? config.sourceLanguage,
+		};
 
 		jobState.value = 'translating';
 		cancelled.value = false;
@@ -120,19 +152,19 @@ export function useTranslationJob(options: {
 	function cancel() {
 		cancelled.value = true;
 
-		for (const controller of abortControllers.value.values()) {
+		for (const controller of abortControllers.values()) {
 			controller.abort();
 		}
 
-		abortControllers.value.clear();
+		abortControllers.clear();
 		langStatuses.value = {};
 		jobState.value = 'idle';
 	}
 
 	function reset() {
 		cancel();
-		langStatuses.value = {};
 		jobConfig = null;
+		jobShared = null;
 	}
 
 	async function retry(langCode: string) {
@@ -147,36 +179,13 @@ export function useTranslationJob(options: {
 	}
 
 	async function translateLanguage(langCode: string, retryCount = 0): Promise<void> {
-		if (cancelled.value || !jobConfig) return;
+		if (cancelled.value || !jobConfig || !jobShared) return;
 
 		langStatuses.value[langCode] = { status: retryCount > 0 ? 'retrying' : 'translating' };
 
 		const config = jobConfig;
-		const fieldsWithContent = Object.keys(config.sourceContent);
-		const fieldDefsByName = new Map(config.fieldDefinitions.map((f) => [f.field, f]));
-
-		const selectedFieldDefinitions = fieldsWithContent
-			.map((fieldName) => fieldDefsByName.get(fieldName))
-			.filter((field): field is Field => field !== undefined);
-
-		const fieldProperties: Record<string, any> = {};
-
-		for (const field of selectedFieldDefinitions) {
-			fieldProperties[field.field] = {
-				type: 'string',
-				description: getAiTranslationFieldDescription(field),
-			};
-		}
-
-		const outputSchema = {
-			type: 'object',
-			properties: fieldProperties,
-			required: fieldsWithContent,
-		};
-
-		const langOptionsByCode = new Map(options.languageOptions.value.map((l) => [l.value, l]));
+		const { selectedFieldDefinitions, outputSchema, langOptionsByCode, sourceLangName } = jobShared;
 		const langName = langOptionsByCode.get(langCode)?.text ?? langCode;
-		const sourceLangName = langOptionsByCode.get(config.sourceLanguage)?.text ?? config.sourceLanguage;
 
 		const prompt = buildAiTranslationPrompt({
 			sourceLangName,
@@ -188,7 +197,7 @@ export function useTranslationJob(options: {
 		});
 
 		const abortController = new AbortController();
-		abortControllers.value.set(langCode, abortController);
+		abortControllers.set(langCode, abortController);
 
 		try {
 			const response = await api.post(
@@ -204,7 +213,7 @@ export function useTranslationJob(options: {
 				},
 			);
 
-			abortControllers.value.delete(langCode);
+			abortControllers.delete(langCode);
 
 			if (cancelled.value) return;
 
@@ -217,7 +226,7 @@ export function useTranslationJob(options: {
 				fieldCount: Object.keys(translations).length,
 			};
 		} catch (error: any) {
-			abortControllers.value.delete(langCode);
+			abortControllers.delete(langCode);
 
 			if (cancelled.value) return;
 			if (error?.name === 'CanceledError' || error?.name === 'AbortError') return;

@@ -189,14 +189,9 @@ function applyTranslatedFields(translatedFields: Record<string, string>, lang: s
 	updateValue(draft, lang);
 }
 
-// Instantiate translation job composable
 const translationJob = useTranslationJob({
 	applyTranslatedFields,
 	languageOptions: computed(() => languageOptions.value),
-	displayItems: computed(() => displayItems.value),
-	fields,
-	relationInfo: computed(() => relationInfo.value),
-	getItemWithLang,
 });
 
 const translationProps = computed(() => ({

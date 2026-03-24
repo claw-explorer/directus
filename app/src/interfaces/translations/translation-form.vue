@@ -207,8 +207,8 @@ function onToggleDelete(item: DisplayItem, itemInitial?: DisplayItem) {
 
 				<button
 					v-else-if="showAiTranslate"
-					class="header-translate-btn"
 					ref="translateBtn"
+					class="header-translate-btn"
 					@click.stop="emit('openTranslateDrawer')"
 				>
 					<AiMagicButton :animate="isHoveringTranslateButton" class="header-sparkle" />
