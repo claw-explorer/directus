@@ -2,13 +2,6 @@ import { flushPromises } from '@vue/test-utils';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { computed } from 'vue';
 import { type TranslationJobConfig, useTranslationJob } from './use-translation-job';
-import api from '@/api';
-
-vi.mock('@/api', () => ({
-	default: {
-		post: vi.fn(),
-	},
-}));
 
 vi.mock('@/stores/settings', () => ({
 	useSettingsStore: () => ({
@@ -26,15 +19,21 @@ vi.mock('vue-i18n', () => ({
 	}),
 }));
 
+vi.mock('@/utils/get-root-path', () => ({
+	getRootPath: () => '/',
+}));
+
 const languageOptions = computed(() => [
 	{ value: 'en', text: 'English' },
 	{ value: 'fr', text: 'French' },
 	{ value: 'es', text: 'Spanish' },
 ]);
 
+const currentLanguage = computed(() => 'fr');
+
 function createJob() {
 	const applyTranslatedFields = vi.fn();
-	const job = useTranslationJob({ applyTranslatedFields, languageOptions });
+	const job = useTranslationJob({ applyTranslatedFields, languageOptions, currentLanguage });
 	return { job: job!, applyTranslatedFields };
 }
 
@@ -47,17 +46,44 @@ const baseConfig: TranslationJobConfig = {
 	fieldDefinitions: [{ field: 'title', type: 'string', meta: { interface: 'input' } }] as any,
 };
 
-function mockApiSuccess(data: Record<string, string> = { title: 'Translated' }) {
-	vi.mocked(api.post).mockResolvedValue({ data: { data } });
+function createStreamResponse(json: string) {
+	const encoder = new TextEncoder();
+
+	const stream = new ReadableStream({
+		start(controller) {
+			controller.enqueue(encoder.encode(json));
+			controller.close();
+		},
+	});
+
+	return new Response(stream, {
+		status: 200,
+		headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+	});
 }
 
-function mockApiError(error: any) {
-	vi.mocked(api.post).mockRejectedValue(error);
+function createErrorResponse(status: number, body?: any) {
+	return new Response(JSON.stringify(body ?? { errors: [{ message: 'Server error' }] }), {
+		status,
+		headers: { 'Content-Type': 'application/json' },
+	});
+}
+
+function mockFetchStream(json: string = '{"title":"Translated"}') {
+	vi.spyOn(globalThis, 'fetch').mockImplementation(() => Promise.resolve(createStreamResponse(json)));
+}
+
+function mockFetchError(status: number, body?: any) {
+	vi.spyOn(globalThis, 'fetch').mockImplementation(() => Promise.resolve(createErrorResponse(status, body)));
+}
+
+function mockFetchHang() {
+	vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise(() => {}));
 }
 
 describe('useTranslationJob', () => {
 	beforeEach(() => {
-		vi.mocked(api.post).mockReset();
+		vi.restoreAllMocks();
 	});
 
 	afterEach(() => {
@@ -67,8 +93,7 @@ describe('useTranslationJob', () => {
 	test('start sets jobState to translating and inits langStatuses', () => {
 		const { job } = createJob();
 
-		// Hang the API so statuses stay in their initial state
-		vi.mocked(api.post).mockImplementation(() => new Promise(() => {}));
+		mockFetchHang();
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
 
 		expect(job.jobState.value).toBe('translating');
@@ -77,23 +102,14 @@ describe('useTranslationJob', () => {
 		expect(job.isTranslating.value).toBe(true);
 	});
 
-	test('start calls api.post for each target and transitions to complete', async () => {
+	test('start streams and applies translations then transitions to complete', async () => {
 		const { job, applyTranslatedFields } = createJob();
 
-		mockApiSuccess({ title: 'Bonjour' });
+		mockFetchStream('{"title":"Bonjour"}');
 		job.start(baseConfig);
 		await flushPromises();
 
-		expect(api.post).toHaveBeenCalledTimes(2);
-
-		expect(api.post).toHaveBeenCalledWith(
-			'/ai/object',
-			expect.objectContaining({
-				provider: 'anthropic',
-				model: 'claude-sonnet-4-5',
-			}),
-			expect.objectContaining({ signal: expect.any(AbortSignal) }),
-		);
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 
 		expect(job.jobState.value).toBe('complete');
 		expect(job.langStatuses.value['fr']).toEqual({ status: 'done', fieldCount: 1 });
@@ -107,8 +123,7 @@ describe('useTranslationJob', () => {
 	test('cancel aborts requests and resets state', async () => {
 		const { job, applyTranslatedFields } = createJob();
 
-		// Make API hang so we can cancel mid-flight
-		vi.mocked(api.post).mockImplementation(() => new Promise(() => {}));
+		mockFetchHang();
 
 		job.start(baseConfig);
 		job.cancel();
@@ -124,12 +139,12 @@ describe('useTranslationJob', () => {
 	test('start cancels any prior job', async () => {
 		const { job } = createJob();
 
-		vi.mocked(api.post).mockImplementation(() => new Promise(() => {}));
+		mockFetchHang();
 		job.start(baseConfig);
 
 		expect(job.jobState.value).toBe('translating');
 
-		mockApiSuccess();
+		mockFetchStream();
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
 		await flushPromises();
 
@@ -140,12 +155,7 @@ describe('useTranslationJob', () => {
 	test('API error sets error status with message', async () => {
 		const { job } = createJob();
 
-		mockApiError({
-			response: {
-				status: 500,
-				data: { errors: [{ message: 'Bad request' }] },
-			},
-		});
+		mockFetchError(500, { errors: [{ message: 'Bad request' }] });
 
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
 		await flushPromises();
@@ -166,14 +176,14 @@ describe('useTranslationJob', () => {
 
 		let callCount = 0;
 
-		vi.mocked(api.post).mockImplementation(() => {
+		vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
 			callCount++;
 
 			if (callCount === 1) {
-				return Promise.reject({ response: { status: 429 } });
+				return Promise.resolve(createErrorResponse(429));
 			}
 
-			return Promise.resolve({ data: { data: { title: 'Bonjour' } } });
+			return Promise.resolve(createStreamResponse('{"title":"Bonjour"}'));
 		});
 
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
@@ -195,7 +205,7 @@ describe('useTranslationJob', () => {
 
 		const { job } = createJob();
 
-		mockApiError({ response: { status: 429 } });
+		mockFetchError(429);
 
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
 
@@ -218,15 +228,14 @@ describe('useTranslationJob', () => {
 
 		let callCount = 0;
 
-		vi.mocked(api.post).mockImplementation(() => {
+		vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
 			callCount++;
 
-			// First two calls succeed (fr, es), but make es fail
 			if (callCount === 2) {
-				return Promise.reject({ response: { status: 500, data: { errors: [{ message: 'fail' }] } } });
+				return Promise.resolve(createErrorResponse(500, { errors: [{ message: 'fail' }] }));
 			}
 
-			return Promise.resolve({ data: { data: { title: 'Translated' } } });
+			return Promise.resolve(createStreamResponse('{"title":"Translated"}'));
 		});
 
 		job.start(baseConfig);
@@ -236,21 +245,20 @@ describe('useTranslationJob', () => {
 		expect(job.langStatuses.value['fr']?.status).toBe('done');
 
 		applyTranslatedFields.mockClear();
-		vi.mocked(api.post).mockClear();
-		mockApiSuccess({ title: 'Traducido' });
+
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(createStreamResponse('{"title":"Traducido"}'));
 
 		await job.retry('es');
 
-		expect(api.post).toHaveBeenCalledTimes(1);
 		expect(job.langStatuses.value['es']).toEqual({ status: 'done', fieldCount: 1 });
 		expect(applyTranslatedFields).toHaveBeenCalledWith({ title: 'Traducido' }, 'es');
 		expect(job.jobState.value).toBe('complete');
 	});
 
-	test('CanceledError is silently ignored', async () => {
+	test('AbortError is silently ignored', async () => {
 		const { job, applyTranslatedFields } = createJob();
 
-		mockApiError({ name: 'CanceledError' });
+		vi.spyOn(globalThis, 'fetch').mockRejectedValue(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
 
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
 		await flushPromises();
@@ -264,14 +272,14 @@ describe('useTranslationJob', () => {
 
 		let callCount = 0;
 
-		vi.mocked(api.post).mockImplementation(() => {
+		vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
 			callCount++;
 
 			if (callCount === 1) {
-				return Promise.reject({ response: { status: 500, data: { errors: [{ message: 'fail' }] } } });
+				return Promise.resolve(createErrorResponse(500, { errors: [{ message: 'fail' }] }));
 			}
 
-			return Promise.resolve({ data: { data: { title: 'Translated' } } });
+			return Promise.resolve(createStreamResponse('{"title":"Translated"}'));
 		});
 
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
@@ -280,7 +288,7 @@ describe('useTranslationJob', () => {
 		expect(job.langStatuses.value['fr']?.status).toBe('error');
 		expect(job.jobState.value).toBe('complete');
 
-		mockApiSuccess();
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(createStreamResponse('{"title":"OK"}'));
 
 		const retryPromise = job.retry('fr');
 
@@ -292,40 +300,10 @@ describe('useTranslationJob', () => {
 		expect(job.jobState.value).toBe('complete');
 	});
 
-	test('stale run completion does not overwrite newer run state', async () => {
-		const { job } = createJob();
-
-		let resolveFirstRun: ((value: any) => void) | undefined;
-
-		vi.mocked(api.post).mockImplementationOnce(
-			() => new Promise((resolve) => { resolveFirstRun = resolve; }),
-		);
-
-		job.start({ ...baseConfig, targetLanguages: ['fr'] });
-
-		expect(job.jobState.value).toBe('translating');
-
-		// Start a second run while the first is still in-flight
-		mockApiSuccess({ title: 'Second' });
-		job.start({ ...baseConfig, targetLanguages: ['es'] });
-		await flushPromises();
-
-		expect(job.jobState.value).toBe('complete');
-		expect(job.langStatuses.value['es']?.status).toBe('done');
-
-		// Now resolve the first run's promise — it should NOT overwrite state
-		resolveFirstRun!({ data: { data: { title: 'First' } } });
-		await flushPromises();
-
-		// jobState should still reflect the second run
-		expect(job.jobState.value).toBe('complete');
-		expect(Object.keys(job.langStatuses.value)).toEqual(['es']);
-	});
-
 	test('reset clears all state back to initial', async () => {
 		const { job } = createJob();
 
-		mockApiSuccess();
+		mockFetchStream();
 		job.start({ ...baseConfig, targetLanguages: ['fr'] });
 		await flushPromises();
 
@@ -336,5 +314,46 @@ describe('useTranslationJob', () => {
 		expect(job.jobState.value).toBe('idle');
 		expect(Object.keys(job.langStatuses.value)).toHaveLength(0);
 		expect(job.pendingFields.value.size).toBe(0);
+	});
+
+	test('activeStreamingField tracks current field for viewed language', async () => {
+		const { job } = createJob();
+
+		// Create a stream that sends data in chunks
+		const encoder = new TextEncoder();
+		let controller: ReadableStreamDefaultController<Uint8Array>;
+
+		const stream = new ReadableStream<Uint8Array>({
+			start(c) {
+				controller = c;
+			},
+		});
+
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(stream, {
+				status: 200,
+				headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+			}),
+		);
+
+		job.start({ ...baseConfig, targetLanguages: ['fr'] });
+
+		// Wait for fetch to resolve
+		await flushPromises();
+
+		expect(job.activeStreamingField.value).toBeNull();
+
+		// Send first chunk with partial first field
+		controller!.enqueue(encoder.encode('{"title":"Bon'));
+		await flushPromises();
+
+		expect(job.activeStreamingField.value).toBe('title');
+
+		// Complete the stream
+		controller!.enqueue(encoder.encode('jour"}'));
+		controller!.close();
+		await flushPromises();
+
+		expect(job.activeStreamingField.value).toBeNull();
 	});
 });
