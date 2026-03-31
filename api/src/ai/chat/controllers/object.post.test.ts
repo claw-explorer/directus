@@ -1,18 +1,17 @@
 import { ForbiddenError, InvalidPayloadError, ServiceUnavailableError } from '@directus/errors';
-import { generateText, jsonSchema, wrapLanguageModel } from 'ai';
-import type { NextFunction, Request, Response } from 'express';
+import { jsonSchema, streamObject, wrapLanguageModel } from 'ai';
+import type { Request, Response } from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getDevToolsMiddleware } from '../../devtools/index.js';
 import { buildProviderConfigs, createAIProviderRegistry, getProviderOptions } from '../../providers/index.js';
 import { getAITelemetryConfig } from '../../telemetry/index.js';
 import { aiObjectPostHandler } from './object.post.js';
 
+const mockPipeTextStreamToResponse = vi.fn();
+
 vi.mock('ai', () => ({
-	generateText: vi.fn(),
+	streamObject: vi.fn(() => ({ pipeTextStreamToResponse: mockPipeTextStreamToResponse })),
 	jsonSchema: vi.fn((schema: unknown) => schema),
-	Output: {
-		object: vi.fn(({ schema }: { schema: unknown }) => ({ type: 'object', schema })),
-	},
 	wrapLanguageModel: vi.fn(({ model }: { model: unknown }) => model),
 }));
 
@@ -33,7 +32,6 @@ vi.mock('../../telemetry/index.js', () => ({
 describe('aiObjectPostHandler', () => {
 	let mockReq: Partial<Request>;
 	let mockRes: Partial<Response>;
-	let mockNext: NextFunction;
 
 	const validBody = {
 		provider: 'openai',
@@ -50,8 +48,6 @@ describe('aiObjectPostHandler', () => {
 	};
 
 	beforeEach(() => {
-		mockNext = vi.fn();
-
 		mockReq = {
 			body: { ...validBody },
 			accountability: { user: 'test-user', role: 'test-role', app: true } as any,
@@ -86,10 +82,6 @@ describe('aiObjectPostHandler', () => {
 		} as any);
 
 		vi.mocked(getProviderOptions).mockReturnValue({});
-
-		vi.mocked(generateText).mockResolvedValue({
-			output: { name: 'John', age: 30 },
-		} as any);
 	});
 
 	afterEach(() => {
@@ -100,7 +92,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw ForbiddenError when accountability is missing', async () => {
 			delete (mockReq as any).accountability;
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				ForbiddenError,
 			);
 		});
@@ -108,7 +100,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw ForbiddenError when app is false', async () => {
 			mockReq.accountability = { user: 'test', role: 'test', app: false } as any;
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				ForbiddenError,
 			);
 		});
@@ -118,7 +110,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw InvalidPayloadError when provider is missing', async () => {
 			mockReq.body = { model: 'gpt-5', prompt: 'test', outputSchema: validBody.outputSchema };
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				InvalidPayloadError,
 			);
 		});
@@ -126,7 +118,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw InvalidPayloadError when prompt is missing', async () => {
 			mockReq.body = { provider: 'openai', model: 'gpt-5', outputSchema: validBody.outputSchema };
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				InvalidPayloadError,
 			);
 		});
@@ -134,7 +126,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw InvalidPayloadError when outputSchema is missing', async () => {
 			mockReq.body = { provider: 'openai', model: 'gpt-5', prompt: 'test' };
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				InvalidPayloadError,
 			);
 		});
@@ -142,7 +134,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw InvalidPayloadError when provider is invalid', async () => {
 			mockReq.body = { ...validBody, provider: 'invalid-provider' };
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				InvalidPayloadError,
 			);
 		});
@@ -152,7 +144,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw ForbiddenError when model is not in allowed list', async () => {
 			mockReq.body = { ...validBody, model: 'not-allowed' };
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				ForbiddenError,
 			);
 		});
@@ -160,7 +152,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw ForbiddenError when allowedModels is null', async () => {
 			mockRes.locals!['ai'].settings.openaiAllowedModels = null;
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				ForbiddenError,
 			);
 		});
@@ -168,7 +160,7 @@ describe('aiObjectPostHandler', () => {
 		it('should throw ForbiddenError when allowedModels is empty', async () => {
 			mockRes.locals!['ai'].settings.openaiAllowedModels = [];
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				ForbiddenError,
 			);
 		});
@@ -180,9 +172,9 @@ describe('aiObjectPostHandler', () => {
 
 			mockReq.body = { ...validBody, provider: 'openai-compatible', model: 'any-model' };
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
-			expect(mockNext).toHaveBeenCalled();
+			expect(mockPipeTextStreamToResponse).toHaveBeenCalledWith(mockRes);
 		});
 	});
 
@@ -190,21 +182,20 @@ describe('aiObjectPostHandler', () => {
 		it('should throw ServiceUnavailableError when provider has no API key', async () => {
 			vi.mocked(buildProviderConfigs).mockReturnValue([]);
 
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
+			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn())).rejects.toThrow(
 				ServiceUnavailableError,
 			);
 		});
 	});
 
-	describe('structured output generation', () => {
-		it('should call generateText with correct parameters', async () => {
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+	describe('streaming output generation', () => {
+		it('should call streamObject with correct parameters', async () => {
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
-			expect(vi.mocked(generateText)).toHaveBeenCalledWith(
+			expect(vi.mocked(streamObject)).toHaveBeenCalledWith(
 				expect.objectContaining({
 					model: 'mock-model',
 					prompt: validBody.prompt,
-					output: expect.any(Object),
 					providerOptions: {},
 				}),
 			);
@@ -213,9 +204,9 @@ describe('aiObjectPostHandler', () => {
 		it('should pass maxOutputTokens when provided', async () => {
 			mockReq.body = { ...validBody, maxOutputTokens: 1024 };
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
-			expect(vi.mocked(generateText)).toHaveBeenCalledWith(
+			expect(vi.mocked(streamObject)).toHaveBeenCalledWith(
 				expect.objectContaining({
 					maxOutputTokens: 1024,
 				}),
@@ -223,7 +214,7 @@ describe('aiObjectPostHandler', () => {
 		});
 
 		it('should inject additionalProperties: false into the output schema', async () => {
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
 			const schemaArg = vi.mocked(jsonSchema).mock.calls[0]![0] as Record<string, unknown>;
 			expect(schemaArg).toHaveProperty('additionalProperties', false);
@@ -233,7 +224,7 @@ describe('aiObjectPostHandler', () => {
 			const mockMiddleware = { wrapGenerate: vi.fn() };
 			vi.mocked(getDevToolsMiddleware).mockReturnValue(mockMiddleware as any);
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
 			expect(vi.mocked(wrapLanguageModel)).toHaveBeenCalledWith({
 				model: 'mock-model',
@@ -244,7 +235,7 @@ describe('aiObjectPostHandler', () => {
 		it('should not wrap model when devtools middleware is not available', async () => {
 			vi.mocked(getDevToolsMiddleware).mockReturnValue(null);
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
 			expect(vi.mocked(wrapLanguageModel)).not.toHaveBeenCalled();
 		});
@@ -253,14 +244,14 @@ describe('aiObjectPostHandler', () => {
 			const mockTelemetryConfig = { isEnabled: true, functionId: 'directus-ai-object' };
 			vi.mocked(getAITelemetryConfig).mockReturnValue(mockTelemetryConfig);
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
 			expect(vi.mocked(getAITelemetryConfig)).toHaveBeenCalledWith(
 				{ provider: 'openai', model: 'gpt-5', userId: 'test-user', role: 'test-role' },
 				'directus-ai-object',
 			);
 
-			expect(vi.mocked(generateText)).toHaveBeenCalledWith(
+			expect(vi.mocked(streamObject)).toHaveBeenCalledWith(
 				expect.objectContaining({
 					experimental_telemetry: mockTelemetryConfig,
 				}),
@@ -270,53 +261,25 @@ describe('aiObjectPostHandler', () => {
 		it('should not pass experimental_telemetry when telemetry is not configured', async () => {
 			vi.mocked(getAITelemetryConfig).mockReturnValue(undefined);
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
-			const callArgs = vi.mocked(generateText).mock.calls[0]![0] as Record<string, unknown>;
+			const callArgs = vi.mocked(streamObject).mock.calls[0]![0] as Record<string, unknown>;
 			expect(callArgs).not.toHaveProperty('experimental_telemetry');
 		});
 
 		it('should not pass maxOutputTokens when not provided', async () => {
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
-			const callArgs = vi.mocked(generateText).mock.calls[0]![0] as Record<string, unknown>;
+			const callArgs = vi.mocked(streamObject).mock.calls[0]![0] as Record<string, unknown>;
 			expect(callArgs).not.toHaveProperty('maxOutputTokens');
 		});
 	});
 
 	describe('response handling', () => {
-		it('should set payload with generated object and call next', async () => {
-			const generatedObject = { name: 'Jane', age: 25 };
-			vi.mocked(generateText).mockResolvedValue({ output: generatedObject } as any);
+		it('should pipe the stream to the response', async () => {
+			await aiObjectPostHandler(mockReq as Request, mockRes as Response, vi.fn());
 
-			await aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext);
-
-			expect(mockRes.locals!['payload']).toEqual({ data: generatedObject });
-			expect(mockNext).toHaveBeenCalled();
-		});
-
-		it('should throw ServiceUnavailableError when output is undefined', async () => {
-			vi.mocked(generateText).mockResolvedValue({ output: undefined } as any);
-
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
-				ServiceUnavailableError,
-			);
-		});
-
-		it('should propagate errors from generateText', async () => {
-			vi.mocked(generateText).mockRejectedValue(new Error('rate limit exceeded'));
-
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
-				'rate limit exceeded',
-			);
-		});
-
-		it('should throw ServiceUnavailableError when output is null', async () => {
-			vi.mocked(generateText).mockResolvedValue({ output: null } as any);
-
-			await expect(aiObjectPostHandler(mockReq as Request, mockRes as Response, mockNext)).rejects.toThrow(
-				ServiceUnavailableError,
-			);
+			expect(mockPipeTextStreamToResponse).toHaveBeenCalledWith(mockRes);
 		});
 	});
 });

@@ -1,6 +1,6 @@
 import type { StandardProviderType } from '@directus/ai';
 import { ForbiddenError, InvalidPayloadError, ServiceUnavailableError } from '@directus/errors';
-import { generateText, jsonSchema, Output, wrapLanguageModel } from 'ai';
+import { jsonSchema, streamObject, wrapLanguageModel } from 'ai';
 import type { RequestHandler } from 'express';
 import { fromZodError } from 'zod-validation-error';
 import { getDevToolsMiddleware } from '../../devtools/index.js';
@@ -14,7 +14,7 @@ import { getAITelemetryConfig } from '../../telemetry/index.js';
 import { ObjectRequest } from '../models/object-request.js';
 import { addAdditionalPropertiesToJsonSchema } from '../utils/add-additional-properties-to-json-schema.js';
 
-export const aiObjectPostHandler: RequestHandler = async (req, res, next) => {
+export const aiObjectPostHandler: RequestHandler = async (req, res) => {
 	if (!req.accountability?.app) {
 		throw new ForbiddenError();
 	}
@@ -65,20 +65,14 @@ export const aiObjectPostHandler: RequestHandler = async (req, res, next) => {
 		'directus-ai-object',
 	);
 
-	const result = await generateText({
+	const result = streamObject({
 		model: languageModel,
 		prompt,
-		output: Output.object({ schema: jsonSchema(addAdditionalPropertiesToJsonSchema(outputSchema)) }),
+		schema: jsonSchema(addAdditionalPropertiesToJsonSchema(outputSchema)),
 		providerOptions,
 		...(typeof maxOutputTokens === 'number' ? { maxOutputTokens } : {}),
 		...(telemetryConfig ? { experimental_telemetry: telemetryConfig } : {}),
 	});
 
-	if (result.output == null) {
-		throw new ServiceUnavailableError({ service: 'ai', reason: 'Model did not return structured output' });
-	}
-
-	res.locals['payload'] = { data: result.output };
-
-	return next();
+	result.pipeTextStreamToResponse(res);
 };
