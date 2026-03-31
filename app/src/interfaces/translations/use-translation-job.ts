@@ -1,5 +1,6 @@
 import type { Field } from '@directus/types';
 import { useEventListener } from '@vueuse/core';
+import { parsePartialJson } from 'ai';
 import { computed, type ComputedRef, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import {
@@ -8,8 +9,8 @@ import {
 	normalizeAiTranslatedFields,
 } from './ai-translation';
 import type { AppModelDefinition } from '@/ai/models';
-import api from '@/api';
 import { useSettingsStore } from '@/stores/settings';
+import { getRootPath } from '@/utils/get-root-path';
 
 export type LangStatus = 'pending' | 'translating' | 'retrying' | 'done' | 'error';
 
@@ -33,6 +34,7 @@ const MAX_RETRIES = 3;
 export function useTranslationJob(options: {
 	applyTranslatedFields: (fields: Record<string, string>, lang: string | undefined) => void;
 	languageOptions: ComputedRef<Record<string, any>[]>;
+	currentLanguage: ComputedRef<string | undefined>;
 }) {
 	const { t } = useI18n();
 	const settingsStore = useSettingsStore();
@@ -42,6 +44,16 @@ export function useTranslationJob(options: {
 	const cancelled = ref(false);
 	const abortControllers = new Map<string, AbortController>();
 	let currentRunId = 0;
+
+	// Per-field streaming state: which field is actively streaming per language
+	const streamingFieldByLang = ref<Record<string, string | null>>({});
+
+	// The active streaming field for the currently-viewed language
+	const activeStreamingField = computed(() => {
+		const lang = options.currentLanguage.value;
+		if (!lang) return null;
+		return streamingFieldByLang.value[lang] ?? null;
+	});
 
 	// Snapshot of the config used for the current/last job
 	let jobConfig: TranslationJobConfig | null = null;
@@ -162,6 +174,7 @@ export function useTranslationJob(options: {
 
 		abortControllers.clear();
 		langStatuses.value = {};
+		streamingFieldByLang.value = {};
 		jobState.value = 'idle';
 	}
 
@@ -206,54 +219,134 @@ export function useTranslationJob(options: {
 		abortControllers.set(langCode, abortController);
 
 		try {
-			const response = await api.post(
-				'/ai/object',
-				{
+			const response = await fetch(`${getRootPath()}ai/object`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				credentials: 'include',
+				signal: abortController.signal,
+				body: JSON.stringify({
 					provider: config.model.provider,
 					model: config.model.model,
 					prompt,
 					outputSchema,
-				},
-				{
-					signal: abortController.signal,
-				},
-			);
+				}),
+			});
 
-			abortControllers.delete(langCode);
+			if (!response.ok) {
+				const statusCode = response.status;
 
-			if (cancelled.value || runId !== currentRunId) return;
+				abortControllers.delete(langCode);
 
-			const translations = response.data.data;
+				if (cancelled.value || runId !== currentRunId) return;
 
-			options.applyTranslatedFields(normalizeAiTranslatedFields(translations, selectedFieldDefinitions), langCode);
+				// Rate limit — auto-retry with exponential backoff
+				if (statusCode === 429 && retryCount < MAX_RETRIES) {
+					const delay = Math.pow(2, retryCount) * 1000;
+					langStatuses.value[langCode] = { status: 'retrying' };
+					await new Promise((resolve) => setTimeout(resolve, delay));
 
-			langStatuses.value[langCode] = {
-				status: 'done',
-				fieldCount: Object.keys(translations).length,
-			};
-		} catch (error: any) {
-			abortControllers.delete(langCode);
+					if (!cancelled.value && runId === currentRunId) {
+						return translateLanguage(langCode, retryCount + 1, runId);
+					}
 
-			if (cancelled.value || runId !== currentRunId) return;
-			if (error?.name === 'CanceledError' || error?.name === 'AbortError') return;
-
-			const statusCode = error?.response?.status;
-
-			// Rate limit — auto-retry with exponential backoff
-			if (statusCode === 429 && retryCount < MAX_RETRIES) {
-				const delay = Math.pow(2, retryCount) * 1000;
-				langStatuses.value[langCode] = { status: 'retrying' };
-				await new Promise((resolve) => setTimeout(resolve, delay));
-
-				if (!cancelled.value && runId === currentRunId) {
-					return translateLanguage(langCode, retryCount + 1, runId);
+					return;
 				}
 
+				let errorMessage = t('interfaces.translations.translation_error');
+
+				try {
+					const errorBody = await response.json();
+					errorMessage = errorBody?.errors?.[0]?.message ?? errorMessage;
+				} catch {
+					// ignore parse errors
+				}
+
+				langStatuses.value[langCode] = { status: 'error', error: errorMessage };
 				return;
 			}
 
-			const errorMessage =
-				error?.response?.data?.errors?.[0]?.message ?? error?.message ?? t('interfaces.translations.translation_error');
+			// Stream the response text and parse partial JSON incrementally
+			const reader = response.body?.getReader();
+
+			if (!reader) {
+				throw new Error('No response body');
+			}
+
+			const decoder = new TextDecoder();
+			let jsonText = '';
+			const appliedFields = new Set<string>();
+
+			while (true) {
+				if (cancelled.value || runId !== currentRunId) {
+					reader.cancel();
+					break;
+				}
+
+				const { done, value } = await reader.read();
+
+				if (value) {
+					jsonText += decoder.decode(value, { stream: true });
+
+					const { value: partialObject } = await parsePartialJson(jsonText);
+
+					if (partialObject && typeof partialObject === 'object' && !Array.isArray(partialObject)) {
+						const obj = partialObject as Record<string, unknown>;
+						const receivedKeys = Object.keys(obj);
+
+						// Determine which field is currently streaming (last key with a value)
+						const lastKey = receivedKeys[receivedKeys.length - 1] ?? null;
+						streamingFieldByLang.value = { ...streamingFieldByLang.value, [langCode]: lastKey };
+
+						// Apply completed fields progressively (all except the last one, which may still be streaming)
+						for (const key of receivedKeys.slice(0, -1)) {
+							if (!appliedFields.has(key) && typeof obj[key] === 'string') {
+								const normalized = normalizeAiTranslatedFields({ [key]: obj[key] as string }, selectedFieldDefinitions);
+
+								options.applyTranslatedFields(normalized, langCode);
+								appliedFields.add(key);
+							}
+						}
+					}
+				}
+
+				if (done) {
+					// Apply the final field
+					const { value: finalObject } = await parsePartialJson(jsonText);
+
+					if (finalObject && typeof finalObject === 'object' && !Array.isArray(finalObject)) {
+						const obj = finalObject as Record<string, string>;
+
+						for (const key of Object.keys(obj)) {
+							if (!appliedFields.has(key) && typeof obj[key] === 'string') {
+								const normalized = normalizeAiTranslatedFields({ [key]: obj[key] as string }, selectedFieldDefinitions);
+
+								options.applyTranslatedFields(normalized, langCode);
+								appliedFields.add(key);
+							}
+						}
+					}
+
+					break;
+				}
+			}
+
+			abortControllers.delete(langCode);
+			streamingFieldByLang.value = { ...streamingFieldByLang.value, [langCode]: null };
+
+			if (cancelled.value || runId !== currentRunId) return;
+
+			langStatuses.value[langCode] = {
+				status: 'done',
+				fieldCount: appliedFields.size,
+			};
+		} catch (error: any) {
+			abortControllers.delete(langCode);
+			streamingFieldByLang.value = { ...streamingFieldByLang.value, [langCode]: null };
+
+			if (cancelled.value || runId !== currentRunId) return;
+			if (error?.name === 'AbortError') return;
+
+			const errorMessage = error?.message ?? t('interfaces.translations.translation_error');
 
 			langStatuses.value[langCode] = {
 				status: 'error',
@@ -274,6 +367,7 @@ export function useTranslationJob(options: {
 		progressLabel,
 		pendingLanguages,
 		pendingFields,
+		activeStreamingField,
 		applyTranslatedFields: options.applyTranslatedFields,
 		start,
 		cancel,
